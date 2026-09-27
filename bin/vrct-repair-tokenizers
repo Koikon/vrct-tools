@@ -1,0 +1,35 @@
+#!/bin/bash
+# Repair Hugging Face tokenizer caches that VRCT downloaded under Wine.
+# Wine can't create the cache's symlinks and leaves 0-byte "name?" placeholder
+# files instead, which makes translation fail to start. This deletes those
+# placeholders and downloads the real tokenizer files for that exact revision.
+VRCT_DIR="${VRCT_DIR:-$HOME/Games/umu/vrct/drive_c/users/steamuser/AppData/Local/VRCT}"
+
+find "$VRCT_DIR/weights" -path '*/snapshots/*' -name '*\?' -size 0 -printf '%h\n' 2>/dev/null | sort -u |
+while IFS= read -r snap; do
+    rev=$(basename "$snap")
+    repo=$(basename "$(dirname "$(dirname "$snap")")")   # models--org--name
+    repo=${repo#models--}
+    repo=${repo/--//}
+    echo "Repairing $repo@$rev"
+    find "$snap" -maxdepth 1 -name '*\?' -size 0 -delete
+    files=$(curl -sf "https://huggingface.co/api/models/$repo/revision/$rev" | python3 -c '
+import json, re, sys
+for s in json.load(sys.stdin).get("siblings", []):
+    n = s["rfilename"]
+    if "/" not in n and re.match(r"(tokenizer.*|special_tokens_map\.json|added_tokens\.json|config\.json|vocab.*|merges\.txt|.*\.model|spm.*)$", n):
+        print(n)')
+    if [ -z "$files" ]; then
+        echo "  could not list files for $repo@$rev" >&2
+        continue
+    fi
+    for f in $files; do
+        [ -s "$snap/$f" ] && continue
+        if curl -sfL -o "$snap/$f" "https://huggingface.co/$repo/resolve/$rev/$f"; then
+            echo "  ok $f"
+        else
+            echo "  FAILED $f" >&2
+            rm -f "$snap/$f"
+        fi
+    done
+done

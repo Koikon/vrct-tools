@@ -1,0 +1,12 @@
+[Unit]
+Description=Feed VRCT VRChat-only voice audio (radius gate, music ignored)
+After=pipewire.service pipewire-pulse.service wireplumber.service
+
+[Service]
+ExecStart=%h/.local/bin/vrct-voice-filter run
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

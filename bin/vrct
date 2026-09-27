@@ -1,0 +1,69 @@
+#!/bin/bash
+# Launch VRCT (VRChat translator) through Proton via umu-run
+VRCT_DIR="$HOME/Games/umu/vrct/drive_c/users/steamuser/AppData/Local/VRCT"
+export WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--no-sandbox --disable-gpu"
+export WINEPREFIX="$HOME/Games/umu/vrct" GAMEID=umu-0 PROTONPATH=GE-Proton
+
+vrct_up() { pgrep -f 'AppData.Local.VRCT.VRCT-sidecar\.exe' >/dev/null; }
+vrct_starting() { pgrep -f 'umu-run \./VRCT\.exe' >/dev/null; }
+
+# Don't start a second copy; that makes VRCT hang and queues more launches
+if vrct_up || vrct_starting; then
+    notify-send "VRCT" "VRCT is already running or starting" 2>/dev/null
+    exit 0
+fi
+
+# Fix tokenizer caches broken by in-app model downloads
+"$HOME/.local/bin/vrct-repair-tokenizers"
+
+# Let the previous Wine session finish shutting down, or VRCT quits right after starting
+wineserver=$(ls -d "$HOME"/.local/share/Steam/compatibilitytools.d/GE-Proton*/files/bin/wineserver 2>/dev/null | sort -V | tail -1)
+[ -n "$wineserver" ] && timeout 30 "$wineserver" -w
+for _ in $(seq 1 30); do
+    pgrep -f 'AppData.Local.VRCT' >/dev/null || break
+    sleep 1
+done
+
+webview="$HOME/Games/umu/vrct/drive_c/users/steamuser/AppData/Local/com.vrct.app/EBWebView"
+# Keep VRCT's window off the GPU so it can't cause VRChat frame spikes. VRCT passes its own
+# WebView2 arguments, which override the --disable-gpu above, so turn off hardware
+# acceleration in the WebView profile instead (read at startup, VRCT is closed here)
+gpu_off() {
+    mkdir -p "$webview"
+    python3 - "$webview/Local State" <<'EOF'
+import json, sys
+path = sys.argv[1]
+try:
+    state = json.load(open(path, encoding="utf-8"))
+except (OSError, ValueError):
+    state = {}
+state.setdefault("hardware_acceleration_mode", {})["enabled"] = False
+json.dump(state, open(path, "w", encoding="utf-8"))
+EOF
+}
+
+cd "$VRCT_DIR" || exit 1
+for attempt in 1 2; do
+    gpu_off
+    setsid umu-run ./VRCT.exe "$@" &
+    umu_pid=$!
+    for _ in $(seq 1 60); do
+        vrct_up && exit 0
+        kill -0 "$umu_pid" 2>/dev/null || break
+        sleep 1
+    done
+    # Not up after 60s means VRCT hung before WebView2 started: stop it and retry
+    if kill -0 "$umu_pid" 2>/dev/null; then
+        kill -- -"$umu_pid" 2>/dev/null
+        [ -n "$wineserver" ] && "$wineserver" -k 2>/dev/null
+    fi
+    [ -n "$wineserver" ] && timeout 30 "$wineserver" -w
+    # A force-closed VRCT can leave WebView2's profile unable to start (window opens, UI never
+    # loads). It only holds UI cache, so retry with a fresh one; keep the last broken copy
+    if [ "$attempt" = 1 ] && [ -d "$webview" ]; then
+        rm -rf "$webview".broken*
+        mv "$webview" "$webview.broken"
+    fi
+done
+notify-send "VRCT" "VRCT failed to start" 2>/dev/null
+exit 1

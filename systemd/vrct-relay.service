@@ -1,0 +1,14 @@
+[Unit]
+Description=VRCT translation relay for friends on the home network (Gemini)
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/vrct-relay
+Restart=on-failure
+RestartSec=5
+MemoryHigh=250M
+MemoryMax=300M
+Nice=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,669 @@
+#!/usr/bin/env python3
+"""Translation router for VRCT: this PC answers translation for itself and friends
+on the home network, taking the cheapest path that gives a good answer.
+
+Friends set VRCT's translation engine to "OpenAI Compatible":
+  URL      http://<this PC's LAN IP>:<port>/v1
+  API key  the relay password (vrct-relay info)
+  model    vrct-relay
+
+Three parts: Obsidian is the brain (knowledge), this router is the middle man
+(detects, routes, briefs and checks), and Gemini/DeepL are the bots (rewrite).
+The language is detected from the line's script (kana, hangul, Han, ASCII), not
+taken from VRCT's preset, and the line goes to the other language of the pair
+VRCT asked for (your language <-> target language): Chinese heard on an
+English <-> Chinese pair becomes English, English heard becomes Chinese.
+Every line is routed, first match wins:
+  1. brain       whole line is a term in the Obsidian notes          instant, offline
+  2. skip        line isn't in either language of VRCT's pair         instant, offline
+  3. cache       same line translated recently (cleared when the brain changes)
+  4. coalesce    same line already on its way (friends hearing the
+                 same speaker) -> share that one request
+  5. network     healthiest bot first (Gemini, else DeepL), briefed with the
+                 brain's Style rules, Names and any terms found in the line:
+                 - per-upstream moving-average latency + error rate
+                 - 429/errors open a circuit breaker for a cooldown
+                 - if the first is slower than usual, the second is
+                   raced against it (hedging); first answer wins
+                 - every answer is checked (untranslated leftovers, echo,
+                   explanations, quotes); a rejected one goes to the other
+                   bot and is only used if nothing better comes back
+
+vrct-relay         run the server (the systemd service does this)
+vrct-relay info    what friends type into VRCT
+vrct-relay stats   how many lines took each path, and how fast
+"""
+import ipaddress, json, os, re, secrets, signal, socket, sys, threading, time, unicodedata
+import urllib.error, urllib.request
+from collections import OrderedDict, deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import NamedTuple
+
+CONF_DIR = Path.home() / ".config/vrct-relay"
+PASSWORD_FILE = CONF_DIR / "password"
+CACHE_FILE = Path.home() / ".cache/vrct-relay/cache.json"
+VRCT_CONFIG = Path.home() / "Games/umu/vrct/drive_c/users/steamuser/AppData/Local/VRCT/config.json"
+BRAIN_DIR = Path(os.environ.get("VRCT_BRAIN_DIR", Path.home() / "Documents/OBSIDIAN/Oberon Archive/VRCT Chinese-English"))
+BRAIN_NOTES = ("Translator Brain.md", "Dictionary/*.md")  # earlier notes win when a term repeats
+PORT = 8765
+MODEL_NAME = "vrct-relay"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+GEMINI_MODEL = "gemini-flash-lite-latest"
+MAX_BODY = 32 * 1024
+MAX_PER_MINUTE = 30          # network calls from friends per minute (brain/cache hits are free)
+CACHE_SIZE = 5000            # lines kept (~1 MB)
+CACHE_MAX_CHARS = 200        # longer lines rarely repeat, don't cache them
+HEDGE_MIN, HEDGE_MAX = 1.2, 4.0   # seconds before racing the second upstream
+RELOAD_EVERY = 30            # seconds between checks for edited notes
+KANA = r"\u3040-\u30ff\u31f0-\u31ff\uff66-\uff9f"
+HANGUL = r"\uac00-\ud7af\u1100-\u11ff\u3130-\u318f"
+HAN = r"\u3400-\u9fff\uf900-\ufaff"
+CJK = re.compile(f"[{KANA}{HANGUL}{HAN}]")
+KANA, HANGUL, HAN = (re.compile(f"[{r}]") for r in (KANA, HANGUL, HAN))
+PROMPT_LANGS = re.compile(r"Translate the user provided text from (.+?) to (.+?)\.")
+DEEPL_LANGS = {  # VRCT language name -> (DeepL source, DeepL target)
+    "English": ("EN", "EN-US"), "Chinese Simplified": ("ZH", "ZH-HANS"), "Chinese Traditional": ("ZH", "ZH-HANT"),
+    "Japanese": ("JA", "JA"), "Korean": ("KO", "KO"), "French": ("FR", "FR"), "German": ("DE", "DE"),
+    "Spanish": ("ES", "ES"), "Russian": ("RU", "RU"), "Portuguese": ("PT", "PT-BR"), "Italian": ("IT", "IT"),
+}
+
+
+def normalize(text):
+    """Key for cache/brain: width-folded, lowercased, spaces and edge punctuation trimmed."""
+    t = unicodedata.normalize("NFKC", text).lower()
+    return re.sub(r"\s+", " ", t).strip(" .,!?;:~。，！？、…")
+
+
+def family(lang):
+    """'Chinese Simplified' -> 'Chinese'; None stays None."""
+    return lang and lang.split()[0]
+
+
+def is_cjk(lang):
+    return family(lang) in ("Chinese", "Japanese", "Korean")
+
+
+def opposite(src, pair, preset=None):
+    """Where a line goes. VRCT's prompt names a pair (your language <-> a target language)
+    and a line spoken in one side goes to the other. With this PC's own preset
+    (your language, [enabled targets]) any enabled target also goes to your language, since
+    VRCT labels a Japanese line "Chinese" when both are enabled. Anything else is left as
+    is (None). Unknown non-CJK text (src None) counts as the pair's non-CJK side."""
+    a, b = pair
+    if src is None:
+        src = b if is_cjk(a) else a
+    if family(a) == family(b):
+        return None
+    if family(src) == family(a):
+        return b
+    if family(src) == family(b):
+        return a
+    if preset and family(src) in map(family, preset[1]):
+        return preset[0]
+    return None
+
+
+def detect(text, languages):
+    """The language the line is really in, from its script, since VRCT's setting is
+    often wrong (Chinese preset, Japanese speaker). Kana means Japanese even with
+    kanji; kanji-only lines are the first of Chinese/Japanese in `languages`, else Chinese.
+    Returns None for non-CJK text that isn't plain English (let the upstream detect)."""
+    if KANA.search(text):
+        return "Japanese"
+    if HANGUL.search(text):
+        return "Korean"
+    if HAN.search(text):
+        return next((lang for lang in languages if family(lang) in ("Chinese", "Japanese")), "Chinese Simplified")
+    if text.isascii() and re.search(r"[A-Za-z]", text):
+        return "English"
+    return None
+
+
+# ---------- brain (Obsidian notes, reloaded when they change) ----------
+
+TERM_COLUMNS = {"chinese": "Chinese", "japanese": "Japanese", "korean": "Korean", "heard": None, "term": None}
+MEANING_COLUMNS = ("natural english", "say instead", "english", "meaning")
+
+
+def plain(cell):
+    """Obsidian markdown -> plain text: [[note|alias]] -> alias, emphasis/code marks and \\| escapes dropped."""
+    cell = re.sub(r"\[\[([^\]]+)\]\]", lambda m: re.split(r"\\?\|", m[1])[-1], cell)
+    return re.sub(r"[*_`]", "", cell.replace("\\|", "|")).strip()
+
+
+def parse_notes(paths):
+    """Reads Obsidian notes (frontmatter skipped, tables inside callouts included):
+    - a table whose header has a term column (Chinese / Japanese / Korean / Heard / Term)
+      and a meaning column (Natural English / Say instead / English / Meaning) adds terms;
+      Chinese/Japanese/Korean columns only apply to lines in that language, Heard/Term to any
+    - bullets under a 'Style' heading are rules for the bot, under 'Names' never-translated names
+    Returns ({normalized term: (meaning, language or None)}, style, names)."""
+    terms, style, names = {}, [], []
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        if text.startswith("---\n"):
+            text = text[text.find("\n---", 4) + 4:]
+        section, columns = "", None
+        for raw in text.splitlines():
+            line = raw.strip().lstrip(">").strip()
+            if not line.startswith("|"):
+                columns = None  # a table ends at the first non-table line
+                if line.startswith("#"):
+                    section = line.lstrip("#").strip().lower()
+                elif line.startswith(("- ", "* ")) and section == "style":
+                    style.append(plain(line[2:]))
+                elif line.startswith(("- ", "* ")) and section == "names":
+                    names += [n.strip() for n in plain(line[2:]).split(",") if n.strip()]
+                continue
+            cells = [plain(c) for c in re.split(r"(?<!\\)\|", line.strip("|"))]
+            if columns is None:  # header row
+                header = [c.lower() for c in cells]
+                term = next((i for i, h in enumerate(header) if h in TERM_COLUMNS), None)
+                meaning = next((header.index(h) for h in MEANING_COLUMNS if h in header), None)
+                columns = (term, meaning, TERM_COLUMNS[header[term]]) if None not in (term, meaning) else False
+            elif columns and not set("".join(cells)) <= set("-: ") and max(columns[:2]) < len(cells):
+                meaning = cells[columns[1]].split(" / ")[0].strip()
+                for variant in cells[columns[0]].split("/"):
+                    key = normalize(re.sub(r"\(.*?\)|（.*?）", "", variant))
+                    if key and meaning:
+                        terms.setdefault(key, (meaning, columns[2]))
+    return terms, style, names
+
+
+def term_pattern(terms):
+    """One regex finding every term (2+ chars) in a line, longest first. Latin/number codes
+    (gg, 88) must be whole tokens; CJK terms can sit anywhere."""
+    found = sorted((t for t in terms if len(t) >= 2), key=len, reverse=True)
+    latin = "|".join(re.escape(t) for t in found if t.isascii())
+    other = "|".join(re.escape(t) for t in found if not t.isascii())
+    parts = ([rf"(?<![a-z0-9])(?:{latin})(?![a-z0-9])"] if latin else []) + ([other] if other else [])
+    return re.compile("|".join(parts)) if parts else None
+
+
+class Knowledge(NamedTuple):
+    """One consistent snapshot of the brain (swapped whole on reload, so readers never mix versions)."""
+    stamp: list
+    terms: dict
+    style: list
+    names: list
+    pattern: object
+
+    def answer(self, norm, src, tgt):
+        """Whole-line meaning, when the line is a known term (meanings are English)."""
+        meaning, lang = self.terms.get(norm, (None, None))
+        return meaning if meaning and tgt == "English" and lang in (None, family(src)) else None
+
+    def hints(self, text, src, limit=10):
+        """Terms that appear inside the line, for the bot's glossary."""
+        if not self.pattern:
+            return []
+        found = dict.fromkeys(m[0] for m in self.pattern.finditer(normalize(text)))
+        return [f"{t} = {self.terms[t][0]}" for t in found if self.terms[t][1] in (None, family(src))][:limit]
+
+
+class Brain:
+    def __init__(self, folder, patterns):
+        self.folder, self.patterns, self.lock, self.checked = folder, patterns, threading.Lock(), 0.0
+        self.knowledge = Knowledge(None, {}, [], [], None)
+
+    def current(self):
+        """The knowledge, re-parsed when a note was added, removed or saved (checked every RELOAD_EVERY s)."""
+        with self.lock:
+            now = time.monotonic()
+            if now - self.checked >= RELOAD_EVERY:
+                self.checked = now
+                paths = list(dict.fromkeys(p for pattern in self.patterns for p in sorted(self.folder.glob(pattern))))
+                stamp = [[p.name, p.stat().st_mtime] for p in paths]
+                if stamp != self.knowledge.stamp:
+                    terms, style, names = parse_notes(paths)
+                    self.knowledge = Knowledge(stamp, terms, style, names, term_pattern(terms))
+            return self.knowledge
+
+
+# ---------- middle man: brief the bot, check its answer ----------
+
+def write_brief(system, src, tgt, knowledge, names, hints):
+    """VRCT's prompt with the detected language, plus the brain's style rules, the names
+    in this line and the terms found in it."""
+    parts = [PROMPT_LANGS.sub(f"Translate the user provided text from {src or 'the language it is in'} to {tgt}.", system, count=1),
+             f"The speaker may mix Chinese, Japanese and English in one line: translate all of it into {tgt}, "
+             "keep names as they are, and output only the translation."]
+    if knowledge.style:
+        parts.append("How to sound:\n" + "\n".join(f"- {s}" for s in knowledge.style))
+    if names:
+        parts.append("Names, never translate these: " + ", ".join(names))
+    if hints:
+        parts.append("Glossary for slang in this line (use these meanings):\n" + "\n".join(hints))
+    return "\n\n".join(parts)
+
+
+def check(result, job):
+    """Review of a bot's answer. Returns (cleaned text, problem or None)."""
+    text = result.strip()
+    for _ in range(2):  # "Translation: ..." and quotes, in either order
+        text = re.sub(r"^(translation|translated text|english|chinese|japanese)\s*[:：]\s*", "", text, flags=re.I)
+        if len(text) >= 2 and text[0] + text[-1] in ('""', "''", "“”", "「」", "『』"):
+            text = text[1:-1].strip()
+    if not text:
+        return text, "empty"
+    if not job["tgt"]:  # not a VRCT translation prompt: nothing more to check
+        return text, None
+    rest = text
+    for name in job["names"]:
+        rest = rest.replace(name, "")
+    if is_cjk(job["tgt"]):
+        if not CJK.search(text) and re.search(r"[A-Za-z]{3}", job["text"]):
+            return text, "not in the target language"
+        if any(w.lower() not in job["text"].lower() for w in re.findall(r"[A-Za-z][A-Za-z-]{3,}", rest)):
+            return text, "added Latin text"
+    elif CJK.search(rest):
+        return text, "left untranslated text"
+    if CJK.search(job["text"]) and normalize(text) == normalize(job["text"]):
+        return text, "echoed the input"
+    if len(text) > 3 * len(job["text"]) + 60:
+        return text, "explained instead of translating"
+    return text, None
+
+
+# ---------- cache ----------
+
+class Cache:
+    """LRU of finished translations, saved with the brain stamp they were made under."""
+
+    def __init__(self, path, size):
+        self.path, self.size, self.lock, self.dirty = path, size, threading.Lock(), False
+        try:
+            saved = json.loads(path.read_text())
+            self.stamp, self.data = saved["brain"], OrderedDict(saved["lines"])
+        except (OSError, ValueError, KeyError, TypeError):
+            self.stamp, self.data = None, OrderedDict()
+
+    def sync(self, stamp):
+        """Drops every line when the brain changed: old answers may break its new rules."""
+        with self.lock:
+            if stamp != self.stamp:
+                self.stamp, self.dirty = stamp, True
+                self.data.clear()
+
+    def get(self, key):
+        with self.lock:
+            if key in self.data:
+                self.data.move_to_end(key)
+                return self.data[key]
+
+    def put(self, key, value):
+        with self.lock:
+            self.data[key] = value
+            self.data.move_to_end(key)
+            if len(self.data) > self.size:
+                self.data.popitem(last=False)
+            self.dirty = True
+
+    def save(self):
+        with self.lock:
+            if not self.dirty:
+                return
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"brain": self.stamp, "lines": list(self.data.items())}, ensure_ascii=False))
+            tmp.replace(self.path)
+            self.dirty = False
+
+
+# ---------- bots, with health tracking ----------
+
+class Upstream:
+    def __init__(self, name, call, weight=1):
+        self.name, self.call, self.weight, self.lock = name, call, weight, threading.Lock()
+        self.latency, self.errors, self.open_until, self.fails = 1.0, 0.0, 0.0, 0
+
+    def healthy(self):
+        return time.monotonic() >= self.open_until
+
+    def score(self):  # lower is better
+        return self.latency * (1 + 4 * self.errors) * self.weight
+
+    def record(self, ok, seconds=None, retry_after=None):
+        with self.lock:
+            self.errors = 0.8 * self.errors + 0.2 * (0 if ok else 1)
+            if ok:
+                self.latency, self.fails = 0.8 * self.latency + 0.2 * seconds, 0
+            else:
+                self.fails += 1
+                if retry_after or self.fails >= 3:  # rate-limited, or failing repeatedly
+                    self.open_until = time.monotonic() + (retry_after or 30)
+
+
+_config = (None, None)
+
+
+def vrct_config():
+    """This PC's VRCT config.json, re-read only when it changes (key and preset edits apply live)."""
+    global _config
+    mtime = VRCT_CONFIG.stat().st_mtime
+    if _config[0] != mtime:
+        _config = (mtime, json.loads(VRCT_CONFIG.read_text()))
+    return _config[1]
+
+
+def keys():
+    return vrct_config()["AUTH_KEYS"]
+
+
+def preset():
+    """(your language, [enabled target languages]) of this PC's selected VRCT tab."""
+    c = vrct_config()
+    tab = c["SELECTED_TAB_NO"]
+    targets = [t["language"] for t in c["SELECTED_TARGET_LANGUAGES"][tab].values() if t["enable"]]
+    return c["SELECTED_YOUR_LANGUAGES"][tab]["1"]["language"], targets
+
+
+def http_json(url, payload, headers, timeout=15):
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", **headers})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def call_gemini(job):
+    messages = job["messages"]
+    if job["brief"]:
+        messages = [{"role": "system", "content": job["brief"]}, *messages[1:]]
+    out = http_json(GEMINI_URL, {"model": GEMINI_MODEL, "messages": messages},
+                    {"Authorization": f"Bearer {keys()['Gemini_API']}"})
+    return out["choices"][0]["message"]["content"]
+
+
+class Unsupported(Exception):
+    """The upstream can't do this language pair; not a health problem."""
+
+
+def call_deepl(job):
+    src, tgt = DEEPL_LANGS.get(job["src"]), DEEPL_LANGS.get(job["tgt"])
+    if not tgt:
+        raise Unsupported(f"DeepL can't translate into {job['tgt']}")
+    key = keys()["DeepL_API"]
+    host = "api-free.deepl.com" if key.endswith(":fx") else "api.deepl.com"
+    payload = {"text": [job["text"]], "target_lang": tgt[1]}
+    if src:  # unknown source: DeepL detects it
+        payload["source_lang"] = src[0]
+    out = http_json(f"https://{host}/v2/translate", payload, {"Authorization": f"DeepL-Auth-Key {key}"})
+    return out["translations"][0]["text"]
+
+
+# ---------- router ----------
+
+class Router:
+    def __init__(self):
+        self.brain = Brain(BRAIN_DIR, BRAIN_NOTES)
+        self.cache = Cache(CACHE_FILE, CACHE_SIZE)
+        # DeepL can't follow the brain's brief, so it ranks as if 3x slower: the backup
+        self.upstreams = [Upstream("gemini", call_gemini), Upstream("deepl", call_deepl, weight=3)]
+        self.pool = ThreadPoolExecutor(max_workers=6)
+        self.inflight, self.lock = {}, threading.Lock()
+        self.stats = {p: [0, 0.0] for p in ("brain", "skip", "cache", "coalesce", "gemini", "deepl", "rejected", "failed")}
+
+    def count(self, path, started):
+        with self.lock:
+            self.stats[path][0] += 1
+            self.stats[path][1] += time.monotonic() - started
+
+    def translate(self, messages, network_allowed, local=False):
+        """Returns (text, path). Raises LookupError if no path could answer.
+        local: the request is from this PC's VRCT, whose preset is known."""
+        started = time.monotonic()
+        text = messages[-1]["content"] if messages and messages[-1].get("role") == "user" else ""
+        langs = PROMPT_LANGS.search(messages[0].get("content", "")) if messages else None
+        if not text.strip() or not langs:
+            job = {"messages": messages, "text": text, "src": "", "tgt": "", "names": [], "brief": None}
+            return self._network(job, None, started, network_allowed)
+        pair = langs.groups()  # (your language, target language) in either order
+        mine = preset() if local else None
+        src = detect(text, pair + tuple(mine[1] if mine else ()))  # None = unknown non-CJK
+        tgt = opposite(src, pair, mine)
+        if tgt is None:  # not one of the preset's languages, or nothing to translate
+            self.count("skip", started)
+            return text.strip(), "skip"
+        norm = normalize(text)
+        knowledge = self.brain.current()
+        self.cache.sync(knowledge.stamp)
+
+        if hit := knowledge.answer(norm, src, tgt):
+            self.count("brain", started)
+            return hit, "brain"
+        key = f"{src or 'auto'}|{tgt}|{norm}"
+        if hit := self.cache.get(key):
+            self.count("cache", started)
+            return hit, "cache"
+
+        with self.lock:  # coalesce identical lines already in flight
+            waiting = self.inflight.get(key)
+            if not waiting:
+                self.inflight[key] = mine = Future()
+        if waiting:
+            result = waiting.result(timeout=30)
+            self.count("coalesce", started)
+            return result, "coalesce"
+        try:
+            names = [n for n in knowledge.names if n in text]
+            brief = write_brief(messages[0]["content"], src, tgt, knowledge, names, knowledge.hints(text, src))
+            job = {"messages": messages, "text": text, "src": src or "", "tgt": tgt, "names": names, "brief": brief}
+            result, path = self._network(job, key if len(norm) <= CACHE_MAX_CHARS else None, started, network_allowed)
+            mine.set_result(result)
+            return result, path
+        except BaseException as e:
+            mine.set_exception(e)
+            raise
+        finally:
+            with self.lock:
+                self.inflight.pop(key, None)
+
+    def _network(self, job, cache_key, started, network_allowed):
+        if not network_allowed:
+            raise PermissionError("rate limit")
+        order = sorted((u for u in self.upstreams if u.healthy()), key=Upstream.score)
+        order = order or sorted(self.upstreams, key=lambda u: u.open_until)  # all tripped: try soonest
+        backups, pending, fallback = order[1:], {}, None
+
+        def launch(up):
+            pending[self.pool.submit(up.call, job)] = (up, time.monotonic())
+
+        launch(order[0])
+        hedge_after = min(HEDGE_MAX, max(HEDGE_MIN, 2 * order[0].latency))
+        deadline = time.monotonic() + 25
+        while pending and time.monotonic() < deadline:
+            done, _ = wait(pending, timeout=hedge_after if backups else deadline - time.monotonic(),
+                           return_when=FIRST_COMPLETED)
+            for fut in done:
+                up, t0 = pending.pop(fut)
+                try:
+                    result = fut.result()
+                except urllib.error.HTTPError as e:
+                    up.record(False, retry_after=int(e.headers.get("Retry-After") or 60) if e.code == 429 else None)
+                    continue
+                except Unsupported:
+                    continue
+                except Exception:
+                    up.record(False)
+                    continue
+                up.record(True, time.monotonic() - t0)
+                result, problem = check(result, job)
+                if not problem:
+                    if cache_key:
+                        self.cache.put(cache_key, result)
+                    self.count(up.name, started)
+                    return result, up.name
+                # rejected: ask the other bot, keep this answer as a last resort
+                print(f"{up.name} answer rejected: {problem}", flush=True)
+                self.count("rejected", time.monotonic())
+                if result and not fallback:
+                    fallback = (result, up.name)
+            # nothing usable yet: race the next bot (the first is slow) or try it (the first failed)
+            if backups and (not done or not pending):
+                launch(backups.pop(0))
+        if fallback:  # better than an error, which makes VRCT drop to its offline engine
+            self.count(fallback[1], started)
+            return fallback
+        self.count("failed", started)
+        raise LookupError("no upstream could translate this line")
+
+
+# ---------- HTTP (OpenAI-compatible) ----------
+
+def completion(text):
+    return {"id": f"relay-{secrets.token_hex(6)}", "object": "chat.completion", "created": int(time.time()),
+            "model": MODEL_NAME, "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                                              "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+
+
+class RateLimit:
+    def __init__(self, per_minute):
+        self.per_minute, self.times, self.lock = per_minute, deque(), threading.Lock()
+
+    def allow(self):
+        with self.lock:
+            now = time.monotonic()
+            while self.times and now - self.times[0] >= 60:
+                self.times.popleft()
+            if len(self.times) >= self.per_minute:
+                return False
+            self.times.append(now)
+            return True
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "vrct-relay"
+
+    def send_json(self, status, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def error(self, status, message):
+        self.send_json(status, {"error": {"message": message, "type": "vrct_relay"}})
+
+    def allowed(self):
+        ip = ipaddress.ip_address(self.client_address[0])
+        if not (ip.is_private or ip.is_loopback):
+            self.error(403, "home network only")
+            return False
+        if not secrets.compare_digest(self.headers.get("Authorization", ""), f"Bearer {self.server.password}"):
+            self.error(401, "wrong relay password")
+            return False
+        return True
+
+    def do_GET(self):
+        if not self.allowed():
+            return
+        path = self.path.rstrip("/")
+        if path in ("/v1/models", "/models"):
+            self.send_json(200, {"object": "list", "data": [{"id": MODEL_NAME, "object": "model", "owned_by": "vrct-relay"}]})
+        elif path == "/stats":
+            r, k = self.server.router, self.server.router.brain.current()
+            self.send_json(200, {"paths": {p: {"lines": n, "avg_ms": round(1000 * s / n) if n else 0} for p, (n, s) in r.stats.items()},
+                                 "upstreams": {u.name: {"avg_ms": round(1000 * u.latency), "error_rate": round(u.errors, 2),
+                                                        "paused": not u.healthy()} for u in r.upstreams},
+                                 "cache_lines": len(r.cache.data),
+                                 "brain": {"notes": len(k.stamp or ()), "terms": len(k.terms), "style_rules": len(k.style), "names": len(k.names)}})
+        else:
+            self.error(404, "not found")
+
+    def do_POST(self):
+        if not self.allowed():
+            return
+        if self.path.rstrip("/") not in ("/v1/chat/completions", "/chat/completions"):
+            return self.error(404, "not found")
+        length = int(self.headers.get("Content-Length", 0))
+        if length > MAX_BODY:
+            return self.error(413, "request too large")
+        try:
+            messages = json.loads(self.rfile.read(length))["messages"]
+            # This PC's own VRCT (loopback) isn't rate-limited; friends share MAX_PER_MINUTE network calls
+            local = ipaddress.ip_address(self.client_address[0]).is_loopback
+            text, self.route = self.server.router.translate(messages, local or self.server.limit.allow(), local)
+            self.send_json(200, completion(text))
+        except PermissionError:
+            self.error(429, "relay busy, try again in a minute")
+        except LookupError as e:
+            self.error(502, str(e))
+        except (KeyError, ValueError, TypeError, IndexError):
+            self.error(400, "bad request")
+
+    def log_message(self, fmt, *args):  # one short line per request, never the message text
+        print(f"{self.client_address[0]} {getattr(self, 'route', '-')} {fmt % args}", flush=True)
+
+
+def password():
+    if not PASSWORD_FILE.exists():
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        PASSWORD_FILE.write_text(secrets.token_urlsafe(18) + "\n")
+        PASSWORD_FILE.chmod(0o600)
+    return PASSWORD_FILE.read_text().strip()
+
+
+def lan_ip():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.connect(("192.0.2.1", 9))  # no packet is sent; this picks the LAN interface
+        except OSError:  # Wi-Fi not up yet at boot
+            return "<LAN IP>"
+        return s.getsockname()[0]
+
+
+def info():
+    print("On a friend's PC, in VRCT > Settings > Translation, choose OpenAI Compatible:")
+    print(f"  URL      http://{lan_ip()}:{PORT}/v1")
+    print(f"  API key  {password()}")
+    print(f"  model    {MODEL_NAME}")
+    print("They must be on the same home network as this PC.")
+    print(f"This PC's own VRCT can use it too: URL http://127.0.0.1:{PORT}/v1 (same key/model).")
+
+
+def stats():
+    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/stats", headers={"Authorization": f"Bearer {password()}"})
+    s = json.loads(urllib.request.urlopen(req, timeout=5).read())
+    total = sum(p["lines"] for p in s["paths"].values()) or 1
+    print(f"{'path':<11}{'lines':>7}{'share':>7}{'avg':>9}")
+    for name, p in s["paths"].items():
+        print(f"{name:<11}{p['lines']:>7}{100 * p['lines'] / total:>6.0f}%{p['avg_ms']:>7} ms")
+    for name, u in s["upstreams"].items():
+        print(f"{name}: ~{u['avg_ms']} ms, error rate {u['error_rate']}{', PAUSED' if u['paused'] else ''}")
+    b = s["brain"]
+    print(f"cache: {s['cache_lines']} lines, brain: {b['notes']} notes, {b['terms']} terms, "
+          f"{b['style_rules']} style rules, {b['names']} names")
+
+
+def serve():
+    keys()  # fail early if VRCT's config is missing
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server.password, server.limit, server.router = password(), RateLimit(MAX_PER_MINUTE), Router()
+    router = server.router
+    router.cache.sync(router.brain.current().stamp)  # notes edited while the relay was off
+
+    def saver():
+        while True:
+            time.sleep(300)
+            router.cache.save()
+
+    threading.Thread(target=saver, daemon=True).start()
+    signal.signal(signal.SIGTERM, lambda *_: (router.cache.save(), sys.exit(0)))
+    print(f"vrct-relay on http://{lan_ip()}:{PORT}/v1: {len(router.brain.current().terms)} brain terms, "
+          f"{len(router.cache.data)} cached lines", flush=True)
+    server.serve_forever()
+
+
+args = sys.argv[1:]
+if args == ["info"]:
+    info()
+elif args == ["stats"]:
+    stats()
+elif not args:
+    serve()
+else:
+    sys.exit(__doc__)

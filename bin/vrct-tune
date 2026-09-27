@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Apply the shared VRCT preset, and delete models you don't want.
+
+vrct-tune                     current + installed models
+vrct-tune preset              apply the preset (keeps your models)
+vrct-tune mic <level>         fixed mic threshold (above your background noise, below speech)
+vrct-tune preset mic 500      both at once, with a single VRCT restart
+vrct-tune delete <model>...   delete downloaded models (e.g. "medium", "nllb-200-3.3B-ct2-int8")
+
+The preset filters out text Whisper invents from silence and music, and shortens
+the wait before transcribing (2 s instead of 3) for faster translations. Models and
+compute device stay whatever you picked. Friends on Windows use the same preset
+through vrct-2060.ps1.
+
+VRCT overwrites config.json when it exits and re-downloads a selected model that is
+missing, so changes are made with VRCT closed (it is closed and restarted for you),
+and deleting the selected model first switches VRCT to another installed one.
+"""
+import json, os, shutil, subprocess, sys, time
+from pathlib import Path
+
+VRCT_DIR = Path(os.environ.get("VRCT_DIR", Path.home() / "Games/umu/vrct/drive_c/users/steamuser/AppData/Local/VRCT"))
+CONFIG = VRCT_DIR / "config.json"
+WEIGHTS = VRCT_DIR / "weights"
+LAUNCHER = Path.home() / ".local/bin/vrct"
+
+# Best first. Anything VRCT supports that isn't listed ranks last.
+WHISPER_RANK = ["large-v3-turbo", "large-v3-turbo-int8", "large-v3", "large-v2", "large-v1", "medium", "small", "base", "tiny"]
+CT2_RANK = ["nllb-200-3.3B-ct2-int8", "nllb-200-distilled-1.3B-ct2-int8", "m2m100_1.2B-ct2-int8",
+            "nllb-200-distilled-600M-ct2-int8", "m2m100_418M-ct2-int8"]
+KINDS = {  # kind: (weights subdir, config key, rank)
+    "whisper": ("whisper", "WHISPER_WEIGHT_TYPE", WHISPER_RANK),
+    "ctranslate2": ("ctranslate2", "CTRANSLATE2_WEIGHT_TYPE", CT2_RANK),
+}
+# Text Whisper invents from silence, music and noise (learned from subtitled videos).
+# VRCT's word filter drops any message containing one of these, on mic and speaker.
+# Whole phrases only: a common word like "you" would also drop real sentences.
+HALLUCINATIONS = [
+    "字幕志愿者", "中文字幕", "字幕由", "字幕by", "字幕製作", "优优独播剧场", "優優獨播劇場",
+    "YoYo Television Series Exclusive", "请不吝点赞", "明镜与点点栏目", "谢谢观看", "感谢观看", "謝謝觀看",
+    "明镜需要您的支持", "欢迎订阅", "点赞订阅", "打赏支持",
+    "Amara.org", "ご視聴ありがとうございました", "チャンネル登録", "시청해주셔서 감사합니다",
+    "구독과 좋아요", "Thanks for watching", "Thank you for watching", "Subtitles by",
+    "Please subscribe", "Like and subscribe", "Transcribed by", "Transcription by",
+]
+# Filters VRCT applies to each Whisper segment: dropped if avg_logprob < AVG_LOGPROB
+# or no_speech_prob > NO_SPEECH_PROB. The mic threshold is set by `vrct-tune mic`,
+# since it depends on the mic; the speaker side is gated by vrct-voice-filter.
+# Timeouts: VRCT waits this many seconds of audio (or of silence) before transcribing,
+# so 2 instead of 3 shows text about a second sooner and gives Whisper less audio per pass.
+PRESET = {
+    "MIC_RECORD_TIMEOUT": 2,
+    "MIC_PHRASE_TIMEOUT": 2,
+    "SPEAKER_RECORD_TIMEOUT": 2,
+    "SPEAKER_PHRASE_TIMEOUT": 2,
+    "MIC_AVG_LOGPROB": -1.0,
+    "MIC_NO_SPEECH_PROB": 0.4,
+    "SPEAKER_AUTOMATIC_THRESHOLD": False,
+    "SPEAKER_THRESHOLD": 300,
+    "SPEAKER_AVG_LOGPROB": -1.0,
+    "SPEAKER_NO_SPEECH_PROB": 0.4,
+    "USE_EXCLUDE_WORDS": True,
+}
+
+
+def installed(kind):
+    d = WEIGHTS / KINDS[kind][0]
+    return sorted((p.name for p in d.iterdir() if (p / "model.bin").is_file()), key=lambda n: rank(kind, n)) if d.is_dir() else []
+
+
+def rank(kind, name):
+    r = KINDS[kind][2]
+    return r.index(name) if name in r else len(r)
+
+
+def closest(kind, want, among):
+    """The next model in `among` no bigger than `want`, else the smallest bigger one
+    (never step up in size when a lighter model is installed: that costs frames)."""
+    w = rank(kind, want)
+    smaller = [n for n in among if rank(kind, n) >= w]
+    return (min(smaller, key=lambda n: rank(kind, n)) if smaller
+            else max(among, key=lambda n: rank(kind, n), default=None))
+
+
+def size(path):
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) / 2**30
+
+
+def vrct_running():
+    # VRCT's own Windows processes only (not e.g. an editor open on its config)
+    return subprocess.run(["pgrep", "-f", r"Local\\VRCT\\VRCT"], capture_output=True).returncode == 0
+
+
+def notify(msg):
+    print(msg)
+    subprocess.run(["notify-send", "-a", "VRCT", "VRCT tune", msg], stderr=subprocess.DEVNULL)
+
+
+def with_vrct_closed(change):
+    """Close VRCT, run change(), and restart VRCT if it was running."""
+    running = vrct_running()
+    if running:
+        print("Closing VRCT...")
+        subprocess.run(["pkill", "-f", r"Local\\VRCT\\VRCT\.exe$"])
+        for second in range(60):
+            if not vrct_running():
+                break
+            if second == 20:  # the sidecar can outlive the window for a minute under Wine
+                subprocess.run(["pkill", "-f", r"Local\\VRCT\\VRCT"])
+            time.sleep(1)
+        else:
+            sys.exit(notify("VRCT didn't close, nothing changed"))
+    try:
+        change()
+    finally:
+        if running:
+            print("Restarting VRCT...")
+            subprocess.Popen([LAUNCHER], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def load():
+    return json.loads(CONFIG.read_text())
+
+
+def save(c):
+    shutil.copy2(CONFIG, CONFIG.with_name("config.json.before-tune"))
+    CONFIG.write_text(json.dumps(c, indent=4, ensure_ascii=False))
+
+
+def apply_preset(c):
+    c.update(PRESET)
+    have = {w.lower() for w in c.get("MIC_WORD_FILTER", [])}
+    c["MIC_WORD_FILTER"] = c.get("MIC_WORD_FILTER", []) + [w for w in HALLUCINATIONS if w.lower() not in have]
+
+
+def status():
+    c = load()
+    for kind, (sub, key, _) in KINDS.items():
+        print(f"\n{kind} (selected: {c.get(key, '?')})")
+        for n in installed(kind):
+            mark = "*" if n == c.get(key) else " "
+            print(f"  {mark} {n:36} {size(WEIGHTS / sub / n):5.2f} GiB")
+    print("\nFree space by deleting unselected models: vrct-tune delete <model>")
+
+
+def cmd_apply(preset, mic):
+    """Preset and/or mic threshold, in one VRCT restart."""
+    def change():  # read config only once VRCT is closed: it saves settings as it exits
+        c = load()
+        if preset:
+            apply_preset(c)
+        if mic is not None:
+            c["MIC_AUTOMATIC_THRESHOLD"], c["MIC_THRESHOLD"] = False, mic
+        save(c)
+
+    with_vrct_closed(change)
+    done = (["preset"] if preset else []) + ([f"mic threshold {mic}"] if mic is not None else [])
+    notify(f"Applied {' + '.join(done)} (models unchanged)")
+
+
+def cmd_delete(names):
+    plan = []  # (kind, name)
+    for n in names:
+        kinds = [k for k in KINDS if n in installed(k)]
+        if not kinds:
+            sys.exit(f"{n!r} isn't installed. Installed: " + ", ".join(installed("whisper") + installed("ctranslate2")))
+        plan.append((kinds[0], n))
+    for kind in KINDS:
+        doomed = {n for k, n in plan if k == kind}
+        if doomed and not [n for n in installed(kind) if n not in doomed]:
+            sys.exit(f"Refusing to delete every {kind} model: VRCT would just download one again.")
+
+    def change():  # read config only once VRCT is closed: it saves settings as it exits
+        c = load()
+        switched = False
+        for kind, (_, key, _) in KINDS.items():
+            doomed = {n for k, n in plan if k == kind}
+            if c.get(key) in doomed:
+                new = closest(kind, c[key], [n for n in installed(kind) if n not in doomed])
+                print(f"{c[key]} is selected; switching VRCT to {new}")
+                c[key], switched = new, True
+        if switched:
+            save(c)
+        for kind, n in plan:
+            p = WEIGHTS / KINDS[kind][0] / n
+            freed = size(p)
+            shutil.rmtree(p)
+            print(f"Deleted {n} ({freed:.2f} GiB)")
+
+    with_vrct_closed(change)
+    notify(f"Deleted {', '.join(n for _, n in plan)}")
+
+
+if not CONFIG.exists():
+    sys.exit(f"VRCT config not found at {CONFIG} (run VRCT once, or set VRCT_DIR)")
+args = sys.argv[1:]
+if not args or args == ["status"]:
+    status()
+elif args and args[0] in ("preset", "mic"):
+    preset, rest = args[0] == "preset", args[1:] if args[0] == "preset" else args
+    if rest and not (len(rest) == 2 and rest[0] == "mic" and rest[1].isdigit()):
+        sys.exit(__doc__)
+    cmd_apply(preset, int(rest[1]) if rest else None)
+elif args[0] == "delete" and len(args) > 1:
+    cmd_delete(args[1:])
+else:
+    sys.exit(__doc__)

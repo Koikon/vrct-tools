@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Favorite VRCT language pairs.
+
+~/.config/vrct/favorites, one per line (up to 3 targets):
+  English (United States) > Chinese Simplified (China), Japanese (Japan)
+
+vrct-fav        pick a favorite; applies it to VRCT's current preset tab
+vrct-fav add    save the current tab's languages as a favorite
+"""
+import json, re, subprocess, sys, time
+from pathlib import Path
+
+FAVS = Path.home() / ".config/vrct/favorites"
+CONFIG = Path.home() / "Games/umu/vrct/drive_c/users/steamuser/AppData/Local/VRCT/config.json"
+SAVE = "★ Save current"
+
+
+def lang(s):  # "Japanese (Japan)" -> {"language": "Japanese", "country": "Japan"}
+    name, country = re.fullmatch(r"\s*(.+?)\s*\((.+)\)\s*", s).groups()
+    return {"language": name, "country": country}
+
+
+def fmt(l):
+    return f"{l['language']} ({l['country']})"
+
+
+def current(c):
+    tab = c["SELECTED_TAB_NO"]
+    targets = [t for t in c["SELECTED_TARGET_LANGUAGES"][tab].values() if t["enable"]]
+    return f"{fmt(c['SELECTED_YOUR_LANGUAGES'][tab]['1'])} > {', '.join(map(fmt, targets))}"
+
+
+def apply(c, fav):
+    src, dst = fav.split(">")
+    targets = [lang(t) for t in dst.split(",")]
+    tab = c["SELECTED_TAB_NO"]
+    c["SELECTED_YOUR_LANGUAGES"][tab]["1"] = lang(src) | {"enable": True}
+    for i, slot in c["SELECTED_TARGET_LANGUAGES"][tab].items():
+        n = int(i) - 1
+        slot.update(targets[n] | {"enable": True} if n < len(targets) else {"enable": False})
+
+
+def vrct_running():
+    return subprocess.run(["pgrep", "-f", r"AppData.Local.VRCT"], capture_output=True).returncode == 0
+
+
+def notify(msg):
+    subprocess.run(["notify-send", "-a", "VRCT", "VRCT favorites", msg])
+
+
+favs = FAVS.read_text().splitlines() if FAVS.exists() else []
+config = json.loads(CONFIG.read_text())
+
+pick = SAVE if sys.argv[1:] == ["add"] else subprocess.run(
+    ["omarchy-menu-select", "VRCT languages", *favs, SAVE], capture_output=True, text=True
+).stdout.strip()
+
+if pick == SAVE:
+    fav = current(config)
+    if fav not in favs:
+        FAVS.parent.mkdir(parents=True, exist_ok=True)
+        FAVS.write_text("\n".join(favs + [fav]) + "\n")
+    notify(f"Saved: {fav}")
+elif pick:
+    apply(config, pick)  # parse before touching VRCT, so a bad line changes nothing
+    running = vrct_running()
+    if running:  # VRCT overwrites config.json on exit, so edit only once it's closed
+        subprocess.run(["pkill", "-f", r"Local\\VRCT\\VRCT\.exe$"])
+        for _ in range(60):
+            if not vrct_running():
+                break
+            time.sleep(1)
+        else:
+            sys.exit(notify("VRCT didn't close, nothing changed"))
+        config = json.loads(CONFIG.read_text())  # VRCT saved its settings as it closed
+        apply(config, pick)
+    CONFIG.write_text(json.dumps(config, indent=4, ensure_ascii=False))
+    if running:
+        subprocess.Popen([Path.home() / ".local/bin/vrct"], start_new_session=True)
+    notify(f"{pick}" + (" — restarting VRCT" if running else ""))

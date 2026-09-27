@@ -1,0 +1,186 @@
+#!/bin/bash
+# vrct-voice-filter: control what VRCT's speaker transcription hears.
+#
+# VRCT listens to the silent "VRChat Voices" sink. The service (vrct-voice-filter run)
+# feeds that sink:
+#   on  - only VRChat's audio (Spotify and other apps are ignored), passed through a
+#         loudness gate so only voices within roughly <radius> meters get through
+#   off - everything you hear, ungated (VRCT's original behavior)
+#
+# Usage:
+#   vrct-voice-filter toggle | on | off | status
+#   vrct-voice-filter radius <meters>      live, no VRCT restart needed
+#   vrct-voice-filter earmuffs on|off      follow VRChat's earmuff radius while earmuffs are on
+#   vrct-voice-filter calibrate <meters>   have someone talk at <meters> away for 6s
+#   vrct-voice-filter level                live VRChat loudness meter (Ctrl+C to stop)
+#   vrct-voice-filter run                  the service loop (systemd runs this)
+
+STATE=~/.local/state/vrct-voice-filter
+GATE=~/.local/lib/vrct-voice-filter/gate.py
+EARMUFFS=~/.local/lib/vrct-voice-filter/earmuffs.py
+VRCHAT_REG=~/.local/share/Steam/steamapps/compatdata/438100/pfx/user.reg
+SINK=vrchat_voices
+FMT=(--rate 16000 --channels 1 --format s16)
+NOFALLBACK=(-P '{ node.dont-fallback = true node.dont-reconnect = true node.passive = true }')
+mkdir -p "$STATE"
+
+get() { cat "$STATE/$1" 2>/dev/null || echo "$2"; }
+mode() { get mode on; }
+radius() { get radius 10; }
+# VRChat's earmuff radius wins while the link and earmuffs are both on
+effective_radius() {
+  local e=
+  [ "$(get earmuffs on)" = on ] && e=$(get earmuff_radius "")
+  echo "${e:-$(radius)}"
+}
+refresh_earmuffs() { python3 "$EARMUFFS" >"$STATE/earmuff_radius" 2>/dev/null; update_threshold; }
+# Reference loudness: RMS of a voice at ref_dist meters. VRChat voice volume
+# falls off roughly as 1/distance, so threshold = ref_rms * ref_dist / radius.
+update_threshold() {
+  awk -v r="$(get ref_rms 1500)" -v d="$(get ref_dist 1)" -v m="$(effective_radius)" \
+    'BEGIN { printf "%.0f\n", r * d / m }' >"$STATE/threshold"
+}
+
+vrchat_serial() {
+  pw-dump 2>/dev/null | jq -r 'first(.[] | select(.info.props["application.name"] == "VRChat.exe"
+    and .info.props["media.class"] == "Stream/Output/Audio") | .info.props["object.serial"]) // empty'
+}
+
+# True if something (VRCT) is recording from the VRChat Voices sink
+sink_listened() {
+  local mon
+  mon=$(pactl list short sources 2>/dev/null | awk -v n="$SINK.monitor" '$2 == n {print $1}')
+  [ -n "$mon" ] && pactl list short source-outputs 2>/dev/null | awk -v m="$mon" '$2 == m {f = 1} END {exit !f}'
+}
+
+notify() {
+  notify-send -a "VRCT" -t 2500 "VRCT voice filter" "$1" 2>/dev/null
+  echo "$1"
+}
+
+describe() {
+  if [ "$(mode)" = on ]; then
+    local src=
+    [ "$(effective_radius)" != "$(radius)" ] && src=" (VRChat earmuffs)"
+    echo "ON: VRChat voices within ~$(effective_radius) m$src (threshold $(get threshold ?)), music ignored"
+  else
+    echo "OFF: VRCT hears all desktop audio"
+  fi
+}
+
+case "$1" in
+  on | off)
+    echo "$1" >"$STATE/mode"
+    notify "$(describe)"
+    ;;
+  toggle)
+    [ "$(mode)" = on ] && echo off >"$STATE/mode" || echo on >"$STATE/mode"
+    notify "$(describe)"
+    ;;
+  status)
+    describe
+    systemctl --user is-active --quiet vrct-voice-filter || echo "warning: service not running (systemctl --user start vrct-voice-filter)"
+    ;;
+  radius)
+    [[ "$2" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v m="$2" 'BEGIN { exit !(m > 0) }' ||
+      { echo "usage: vrct-voice-filter radius <meters>"; exit 1; }
+    echo "$2" >"$STATE/radius"
+    update_threshold
+    notify "$(describe)"
+    ;;
+  earmuffs)
+    [[ "$2" =~ ^(on|off)$ ]] || { echo "usage: vrct-voice-filter earmuffs on|off"; exit 1; }
+    echo "$2" >"$STATE/earmuffs"
+    refresh_earmuffs
+    notify "Earmuff link $2. $(describe)"
+    ;;
+  calibrate)
+    [[ "$2" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "usage: vrct-voice-filter calibrate <meters>"; exit 1; }
+    serial=$(vrchat_serial)
+    [ -n "$serial" ] || { echo "VRChat isn't playing audio"; exit 1; }
+    echo "Have someone talk normally ${2} m away. Recording 6 seconds..."
+    # Typical loudness of the voice = 90th percentile of 20 ms frame RMS
+    ref=$(timeout 6 pw-record --target "$serial" "${FMT[@]}" "${NOFALLBACK[@]}" - 2>/dev/null |
+      python3 -c '
+import array, math, sys
+r = []
+while (b := sys.stdin.buffer.read(640)) and len(b) == 640:
+    a = array.array("h", b); r.append(math.sqrt(sum(x * x for x in a) / 320))
+r.sort(); print(int(r[int(len(r) * 0.9)]) if r else 0)')
+    [ "${ref:-0}" -gt 50 ] || { echo "Too quiet to calibrate (level ${ref:-0}). Try again closer."; exit 1; }
+    echo "$ref" >"$STATE/ref_rms"
+    echo "$2" >"$STATE/ref_dist"
+    update_threshold
+    echo "Voice at ${2} m measured $ref."
+    describe
+    ;;
+  level)
+    serial=$(vrchat_serial)
+    [ -n "$serial" ] || { echo "VRChat isn't playing audio"; exit 1; }
+    echo "VRChat loudness (current threshold $(get threshold ?)). Ctrl+C to stop."
+    pw-record --target "$serial" "${FMT[@]}" "${NOFALLBACK[@]}" - 2>/dev/null | python3 "$GATE" /dev/null --meter
+    echo
+    ;;
+  _pipe) # _pipe on|off <source>: one capture -> (gate) -> VRChat Voices pipeline
+    play() { pw-cat --playback --target "$SINK" "${FMT[@]}" "${NOFALLBACK[@]}" -; }
+    if [ "$2" = on ]; then
+      pw-record --target "$3" "${FMT[@]}" "${NOFALLBACK[@]}" - 2>/dev/null |
+        python3 "$GATE" "$STATE/threshold" | play
+    else
+      pw-record --target "$3" -P '{ stream.capture.sink = true node.dont-fallback = true node.passive = true }' \
+        "${FMT[@]}" - 2>/dev/null | play
+    fi
+    ;;
+  run)
+    [ -f "$STATE/threshold" ] || update_threshold
+    pid= running=
+    stop() { [ -n "$pid" ] && kill -- -"$pid" 2>/dev/null; pid= running=; }
+    trap 'stop; exit 0' TERM INT
+    reg_mtime=
+    stalled=0 last_wchar=
+    # True if the gate has been blocked writing to pw-cat with no progress for ~6 s
+    # (pw-cat can silently stop consuming, and nothing exits, so VRCT hears nothing)
+    pipe_stalled() {
+      local g w
+      g=$(pgrep -f -s "$pid" "gate.py" | head -1)
+      [ -n "$g" ] && [ "$(cat /proc/"$g"/wchan 2>/dev/null)" = anon_pipe_write ] || { stalled=0; return 1; }
+      w=$(awk '/^wchar/ {print $2}' /proc/"$g"/io 2>/dev/null)
+      if [ "$w" = "$last_wchar" ]; then stalled=$((stalled + 1)); else stalled=0; fi
+      last_wchar=$w
+      [ "$stalled" -ge 3 ]
+    }
+    while :; do
+      # Follow VRChat's earmuff settings (Wine saves its registry every ~30 s)
+      if [ "$(get earmuffs on)" = on ] && [ "$(stat -c %Y "$VRCHAT_REG" 2>/dev/null)" != "$reg_mtime" ]; then
+        reg_mtime=$(stat -c %Y "$VRCHAT_REG" 2>/dev/null)
+        refresh_earmuffs
+      fi
+      m=$(mode)
+      if [ "$m" = on ]; then
+        src=$(vrchat_serial)
+      else
+        src=$(pactl get-default-sink 2>/dev/null)
+      fi
+      # Feed the sink only while VRCT listens: with no listener the passive pipeline
+      # stops moving, which looked like a stall and restarted it every few seconds
+      sink_listened || src=
+      want="$m:$src"
+      # (Re)start the pipeline when the mode or source changes, or it died
+      if [ "$want" != "$running" ] || { [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; } ||
+        { [ -n "$pid" ] && pipe_stalled && echo "pipeline stalled, restarting"; }; then
+        stop
+        stalled=0 last_wchar=
+        if [ -n "$src" ]; then
+          setsid "$0" _pipe "$m" "$src" &
+          pid=$!
+        fi
+        running=$want
+      fi
+      sleep 2
+    done
+    ;;
+  *)
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac
