@@ -1,4 +1,4 @@
-# vrct-linux-tools
+# vrct-tools
 
 Tools for [VRCT](https://github.com/misyaguziya/VRCT), the VRChat translator, tuned for Chinese and Japanese ↔ English voice chat. Made for Linux (VRCT through Proton), with the relay and tuning also on **Windows** and the relay on **macOS**.
 
@@ -69,8 +69,8 @@ To remove it: `powershell -ExecutionPolicy Bypass -File windows\install-relay.ps
 ## Install (macOS)
 
 ```sh
-git clone https://github.com/Koikon/vrct-linux-tools.git
-cd vrct-linux-tools
+git clone https://github.com/Koikon/vrct-tools.git
+cd vrct-tools
 ./macos/install-relay.sh
 ```
 
