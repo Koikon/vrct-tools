@@ -1,6 +1,15 @@
 # vrct-linux-tools
 
-Tools for running [VRCT](https://github.com/misyaguziya/VRCT), the VRChat translator, on Linux through Proton. It's tuned for Chinese and Japanese ↔ English voice chat.
+Tools for [VRCT](https://github.com/misyaguziya/VRCT), the VRChat translator, tuned for Chinese and Japanese ↔ English voice chat. Made for Linux (VRCT through Proton), with the relay and tuning also on **Windows** and the relay on **macOS**.
+
+| | Linux | Windows | macOS |
+|---|---|---|---|
+| `vrct-relay` + Obsidian brain | ✅ `systemd/` | ✅ `windows/Install relay.bat` | ✅ `macos/install-relay.sh` |
+| Tuning (preset, models) | ✅ `vrct-tune` | ✅ `windows/VRCT Tune.bat` | – |
+| Voice filter (VRChat voices only) | ✅ PipeWire | – | – |
+| Launcher, favorites, tokenizer repair | ✅ | – (VRCT is native) | – |
+
+VRCT and VRChat don't run on macOS, so a Mac acts as the relay for VRCT on other PCs in the same network.
 
 - **`vrct-relay`**: a translation router that VRCT uses as its "OpenAI Compatible" engine. It can also serve friends on the same home network.
 - **Voice filter**: VRCT only hears VRChat voices near you, not music or other apps.
@@ -27,7 +36,7 @@ The relay also has a cache, merges identical lines that are already being transl
 - For the relay: a Gemini and/or DeepL API key, entered in VRCT's own settings. The relay reads them from VRCT's `config.json`.
 - `vrct-fav` uses `omarchy-menu-select` ([Omarchy](https://omarchy.org)). Swap in any dmenu-style picker if you don't use Omarchy.
 
-## Install
+## Install (Linux)
 
 ```sh
 install -Dm755 bin/* -t ~/.local/bin/
@@ -45,6 +54,27 @@ Copy `obsidian/VRCT Chinese-English` into your Obsidian vault. Then point the re
 [Service]
 Environment=VRCT_BRAIN_DIR=%h/path/to/vault/VRCT Chinese-English
 ```
+
+## Install (Windows)
+
+Needs [Python 3.8+](https://www.python.org/downloads/) (tick "Add python.exe to PATH") and VRCT installed normally.
+
+1. Download this repo (Code → Download ZIP) and unzip it.
+2. Double-click **`windows/Install relay.bat`**. It copies the relay and the notes (to `Documents\VRCT Brain`), adds the relay to startup (no admin needed), starts it, and prints what to enter in VRCT. Keys are read from VRCT's own settings; if there are none, it asks for them.
+3. In VRCT → Settings → Translation, choose **OpenAI Compatible** with the printed URL, key and model.
+4. Optional: double-click **`windows/VRCT Tune.bat`** for the tuning menu. It sets up the preset, uses an NVIDIA card for speech-to-text with VRCT's CUDA edition, and picks models that fit the PC.
+
+To remove it: `powershell -ExecutionPolicy Bypass -File windows\install-relay.ps1 -Uninstall`.
+
+## Install (macOS)
+
+```sh
+git clone https://github.com/Koikon/vrct-linux-tools.git
+cd vrct-linux-tools
+./macos/install-relay.sh
+```
+
+It asks for a Gemini and/or DeepL key (saved to `~/Library/Application Support/vrct-relay/keys.json`, readable only by you), copies the notes to `~/Documents/VRCT Brain`, and runs the relay as a LaunchAgent at login (log: `~/Library/Logs/vrct-relay.log`). On the Windows or Linux PCs running VRCT, set **OpenAI Compatible** to the URL it prints. `./macos/install-relay.sh uninstall` removes it.
 
 ## Using it
 

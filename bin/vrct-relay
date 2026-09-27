@@ -29,6 +29,11 @@ Every line is routed, first match wins:
                    explanations, quotes); a rejected one goes to the other
                    bot and is only used if nothing better comes back
 
+Runs on Linux, Windows and macOS. API keys come from VRCT's own settings; on a PC
+without VRCT (e.g. a Mac serving friends) put them in keys.json in the relay's
+config folder. VRCT_BRAIN_DIR points at the Obsidian notes, VRCT_CONFIG at VRCT's
+config.json if it isn't in the usual place.
+
 vrct-relay         run the server (the systemd service does this)
 vrct-relay info    what friends type into VRCT
 vrct-relay stats   how many lines took each path, and how fast
@@ -41,11 +46,24 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import NamedTuple
 
-CONF_DIR = Path.home() / ".config/vrct-relay"
+HOME = Path.home()
+if sys.platform == "win32":
+    CONF_DIR = CACHE_DIR = Path(os.environ["APPDATA"]) / "vrct-relay"
+    VRCT_CONFIG = Path(os.environ["LOCALAPPDATA"]) / "VRCT/config.json"
+    BRAIN_DEFAULT = HOME / "Documents/VRCT Brain"
+elif sys.platform == "darwin":  # VRCT doesn't run on macOS: the relay serves other PCs, keys in keys.json
+    CONF_DIR, CACHE_DIR = HOME / "Library/Application Support/vrct-relay", HOME / "Library/Caches/vrct-relay"
+    VRCT_CONFIG = None
+    BRAIN_DEFAULT = HOME / "Documents/VRCT Brain"
+else:  # Linux: VRCT runs through umu/Proton
+    CONF_DIR, CACHE_DIR = HOME / ".config/vrct-relay", HOME / ".cache/vrct-relay"
+    VRCT_CONFIG = HOME / "Games/umu/vrct/drive_c/users/steamuser/AppData/Local/VRCT/config.json"
+    BRAIN_DEFAULT = HOME / "Documents/OBSIDIAN/Oberon Archive/VRCT Chinese-English"
+VRCT_CONFIG = Path(os.environ["VRCT_CONFIG"]) if os.environ.get("VRCT_CONFIG") else VRCT_CONFIG
+BRAIN_DIR = Path(os.environ.get("VRCT_BRAIN_DIR", BRAIN_DEFAULT))
 PASSWORD_FILE = CONF_DIR / "password"
-CACHE_FILE = Path.home() / ".cache/vrct-relay/cache.json"
-VRCT_CONFIG = Path.home() / "Games/umu/vrct/drive_c/users/steamuser/AppData/Local/VRCT/config.json"
-BRAIN_DIR = Path(os.environ.get("VRCT_BRAIN_DIR", Path.home() / "Documents/OBSIDIAN/Oberon Archive/VRCT Chinese-English"))
+KEYS_FILE = CONF_DIR / "keys.json"   # {"Gemini_API": "...", "DeepL_API": "..."}, used when there's no VRCT
+CACHE_FILE = CACHE_DIR / "cache.json"
 BRAIN_NOTES = ("Translator Brain.md", "Dictionary/*.md")  # earlier notes win when a term repeats
 PORT = 8765
 MODEL_NAME = "vrct-relay"
@@ -275,7 +293,7 @@ class Cache:
     def __init__(self, path, size):
         self.path, self.size, self.lock, self.dirty = path, size, threading.Lock(), False
         try:
-            saved = json.loads(path.read_text())
+            saved = json.loads(path.read_text(encoding="utf-8"))
             self.stamp, self.data = saved["brain"], OrderedDict(saved["lines"])
         except (OSError, ValueError, KeyError, TypeError):
             self.stamp, self.data = None, OrderedDict()
@@ -307,7 +325,7 @@ class Cache:
                 return
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"brain": self.stamp, "lines": list(self.data.items())}, ensure_ascii=False))
+            tmp.write_text(json.dumps({"brain": self.stamp, "lines": list(self.data.items())}, ensure_ascii=False), encoding="utf-8")
             tmp.replace(self.path)
             self.dirty = False
 
@@ -340,21 +358,30 @@ _config = (None, None)
 
 
 def vrct_config():
-    """This PC's VRCT config.json, re-read only when it changes (key and preset edits apply live)."""
+    """This PC's VRCT config.json ({} without VRCT), re-read only when it changes (edits apply live)."""
     global _config
+    if not (VRCT_CONFIG and VRCT_CONFIG.exists()):
+        return {}
     mtime = VRCT_CONFIG.stat().st_mtime
     if _config[0] != mtime:
-        _config = (mtime, json.loads(VRCT_CONFIG.read_text()))
+        _config = (mtime, json.loads(VRCT_CONFIG.read_text(encoding="utf-8")))
     return _config[1]
 
 
 def keys():
-    return vrct_config()["AUTH_KEYS"]
+    """API keys from VRCT's settings, else from keys.json."""
+    if found := vrct_config().get("AUTH_KEYS"):
+        return found
+    if KEYS_FILE.exists():
+        return json.loads(KEYS_FILE.read_text(encoding="utf-8"))
+    raise FileNotFoundError(f"no API keys: enter them in VRCT's settings, or put them in {KEYS_FILE}")
 
 
 def preset():
-    """(your language, [enabled target languages]) of this PC's selected VRCT tab."""
+    """(your language, [enabled target languages]) of this PC's selected VRCT tab, or None without VRCT."""
     c = vrct_config()
+    if not c:
+        return None
     tab = c["SELECTED_TAB_NO"]
     targets = [t["language"] for t in c["SELECTED_TARGET_LANGUAGES"][tab].values() if t["enable"]]
     return c["SELECTED_YOUR_LANGUAGES"][tab]["1"]["language"], targets
@@ -367,29 +394,37 @@ def http_json(url, payload, headers, timeout=15):
         return json.loads(r.read())
 
 
+class Unsupported(Exception):
+    """The upstream can't do this (no API key, or the language pair); not a health problem."""
+
+
+def key(name):
+    if not (found := keys().get(name)):
+        raise Unsupported(f"no {name} key")
+    return found
+
+
 def call_gemini(job):
     messages = job["messages"]
     if job["brief"]:
         messages = [{"role": "system", "content": job["brief"]}, *messages[1:]]
     out = http_json(GEMINI_URL, {"model": GEMINI_MODEL, "messages": messages},
-                    {"Authorization": f"Bearer {keys()['Gemini_API']}"})
+                    {"Authorization": f"Bearer {key('Gemini_API')}"})
     return out["choices"][0]["message"]["content"]
 
 
-class Unsupported(Exception):
-    """The upstream can't do this language pair; not a health problem."""
 
 
 def call_deepl(job):
     src, tgt = DEEPL_LANGS.get(job["src"]), DEEPL_LANGS.get(job["tgt"])
     if not tgt:
         raise Unsupported(f"DeepL can't translate into {job['tgt']}")
-    key = keys()["DeepL_API"]
-    host = "api-free.deepl.com" if key.endswith(":fx") else "api.deepl.com"
+    deepl_key = key("DeepL_API")
+    host = "api-free.deepl.com" if deepl_key.endswith(":fx") else "api.deepl.com"
     payload = {"text": [job["text"]], "target_lang": tgt[1]}
     if src:  # unknown source: DeepL detects it
         payload["source_lang"] = src[0]
-    out = http_json(f"https://{host}/v2/translate", payload, {"Authorization": f"DeepL-Auth-Key {key}"})
+    out = http_json(f"https://{host}/v2/translate", payload, {"Authorization": f"DeepL-Auth-Key {deepl_key}"})
     return out["translations"][0]["text"]
 
 
@@ -602,9 +637,9 @@ class Handler(BaseHTTPRequestHandler):
 def password():
     if not PASSWORD_FILE.exists():
         CONF_DIR.mkdir(parents=True, exist_ok=True)
-        PASSWORD_FILE.write_text(secrets.token_urlsafe(18) + "\n")
+        PASSWORD_FILE.write_text(secrets.token_urlsafe(18) + "\n", encoding="utf-8")
         PASSWORD_FILE.chmod(0o600)
-    return PASSWORD_FILE.read_text().strip()
+    return PASSWORD_FILE.read_text(encoding="utf-8").strip()
 
 
 def lan_ip():
@@ -640,7 +675,7 @@ def stats():
 
 
 def serve():
-    keys()  # fail early if VRCT's config is missing
+    keys()  # fail early if there are no API keys
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.password, server.limit, server.router = password(), RateLimit(MAX_PER_MINUTE), Router()
     router = server.router
@@ -655,7 +690,12 @@ def serve():
     signal.signal(signal.SIGTERM, lambda *_: (router.cache.save(), sys.exit(0)))
     print(f"vrct-relay on http://{lan_ip()}:{PORT}/v1: {len(router.brain.current().terms)} brain terms, "
           f"{len(router.cache.data)} cached lines", flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:  # Ctrl+C in a terminal
+        pass
+    finally:
+        router.cache.save()
 
 
 args = sys.argv[1:]
