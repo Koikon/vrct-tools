@@ -75,3 +75,7 @@ Any note in `Dictionary/` works too. A table only needs a term column (`Chinese`
 - If the relay is unreachable, VRCT switches to its offline engine for the rest of the session. Don't restart the relay mid-session.
 - **Content warning:** the dictionary documents Chinese profanity and insults, each marked mild, rude or offensive.
 - The paths assume the umu prefix location above. `vrchat-launch` and the WiVRn notes mentioned in `VRCT Setup (Linux).md` aren't part of this repo.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
