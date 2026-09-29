@@ -99,6 +99,19 @@ Edit `Translator Brain.md`. The relay picks up changes within 30 seconds and dro
 
 Any note in `Dictionary/` works too. A table only needs a term column (`Chinese`, `Japanese`, `Korean`, `Heard` or `Term`) and a meaning column (`Natural English`, `Say instead`, `English` or `Meaning`).
 
+## VRCT using too much CPU?
+
+VRCT does its speech-to-text on your CPU unless it can use an NVIDIA graphics card, and it listens non-stop to your mic and to other players. Heavy models there can slow your game down or make fans loud. If that happens:
+
+1. **Update this repo** (`git pull`, or download it again). Older versions of the Windows `VRCT Tune` could leave the large `large-v3-turbo` speech model running on the CPU on 8+ core PCs. It now stops at `small`.
+2. **Apply the preset again**: Windows: double-click `VRCT Tune.bat`. Linux: `vrct-tune preset`. It never picks a heavier model than the one you have, only a lighter one.
+3. **Check the models in VRCT → Settings → Transcription / Translation.** Without an NVIDIA card, use `small` (or `base` on 4–6 core CPUs) for speech, and `nllb-200-distilled-600M` for translation. Delete the big ones you don't use: `vrct-tune delete large-v3-turbo` (Linux) or `VRCT Tune.bat delete large-v3-turbo` (Windows).
+4. **Use the relay for translation** (OpenAI Compatible engine): Gemini/DeepL then do the translating instead of your CPU.
+5. **Turn off speaker translation when you don't need it.** It is the part that runs all the time while other people talk.
+6. On Windows, the preset also runs VRCT at below-normal CPU priority so games get the CPU first (it asks for admin once). `VRCT Tune.bat normalpriority` undoes it.
+
+Nothing in this repo mines crypto or runs hidden background work: the only background parts are the relay (which sends the lines you translate to Gemini/DeepL) and, on Linux, the voice filter. High CPU comes from VRCT's own speech models.
+
 ## Notes
 
 - The relay only answers private and loopback addresses and needs its password (`~/.config/vrct-relay/password`, created on first run). Friends share 30 network calls per minute; your own VRCT isn't limited.

@@ -186,7 +186,9 @@ function Get-CudaDevice {
 function Get-FitModels([bool]$whisperOnGpu) {
     $cores = (Get-CimInstance Win32_Processor | Measure-Object NumberOfCores -Sum).Sum
     $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
-    $fit = if ($cores -ge 8) { @{ whisper = "large-v3-turbo"; ctranslate2 = "nllb-200-distilled-1.3B-ct2-int8" } }
+    # Speech-to-text runs non-stop on mic and speaker, so on the CPU "small" is the ceiling:
+    # large-v3-turbo on the CPU keeps several cores busy all the time, even on 8+ core PCs
+    $fit = if ($cores -ge 8) { @{ whisper = "small"; ctranslate2 = "nllb-200-distilled-1.3B-ct2-int8" } }
            elseif ($cores -ge 6) { @{ whisper = "small"; ctranslate2 = "nllb-200-distilled-600M-ct2-int8" } }
            else { @{ whisper = "base"; ctranslate2 = "nllb-200-distilled-600M-ct2-int8" } }
     if ($ramGB -lt 16) { $fit.ctranslate2 = "nllb-200-distilled-600M-ct2-int8" }  # leave RAM to the game
