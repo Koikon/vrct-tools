@@ -43,7 +43,7 @@ EOF
 }
 
 cd "$VRCT_DIR" || exit 1
-for attempt in 1 2; do
+for attempt in 1 2 3 4; do  # WebView2 start is flaky under Wine; a later try usually works
     gpu_off
     setsid umu-run ./VRCT.exe "$@" &
     umu_pid=$!

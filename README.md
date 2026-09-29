@@ -48,7 +48,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now vrct-relay vrct-voice-filter
 ```
 
-Copy `obsidian/VRCT Chinese-English` into your Obsidian vault. Then point the relay at it: `systemctl --user edit vrct-relay`, and add
+On Linux the brain is off by default, so Gemini and DeepL translate each line without the notes. To turn it on, copy `obsidian/VRCT Chinese-English` into your Obsidian vault. Then point the relay at it: `systemctl --user edit vrct-relay`, and add
 
 ```ini
 [Service]

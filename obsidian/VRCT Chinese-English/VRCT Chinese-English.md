@@ -8,6 +8,7 @@ Home note for getting better Chinese→English out of VRCT (VRChat translator), 
 
 ## Setup
 - [[VRCT Setup (Linux)]]: how VRCT runs on this PC, current settings, voice filter, restarting safely, known problems.
+
 - [[Translator Brain]]: the style rules, names and corrections the translation bot follows. Edit it to change how translations sound.
 
 ## Research

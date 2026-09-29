@@ -31,7 +31,7 @@ Every line is routed, first match wins:
 
 Runs on Linux, Windows and macOS. API keys come from VRCT's own settings; on a PC
 without VRCT (e.g. a Mac serving friends) put them in keys.json in the relay's
-config folder. VRCT_BRAIN_DIR points at the Obsidian notes, VRCT_CONFIG at VRCT's
+config folder. VRCT_BRAIN_DIR points at the Obsidian notes (empty/unset on Linux = no brain), VRCT_CONFIG at VRCT's
 config.json if it isn't in the usual place.
 
 vrct-relay         run the server (the systemd service does this)
@@ -58,9 +58,10 @@ elif sys.platform == "darwin":  # VRCT doesn't run on macOS: the relay serves ot
 else:  # Linux: VRCT runs through umu/Proton
     CONF_DIR, CACHE_DIR = HOME / ".config/vrct-relay", HOME / ".cache/vrct-relay"
     VRCT_CONFIG = HOME / "Games/umu/vrct/drive_c/users/steamuser/AppData/Local/VRCT/config.json"
-    BRAIN_DEFAULT = HOME / "Documents/OBSIDIAN/Oberon Archive/VRCT Chinese-English"
+    BRAIN_DEFAULT = ""  # Obsidian brain turned off 2026-09-29: it confused the bot
 VRCT_CONFIG = Path(os.environ["VRCT_CONFIG"]) if os.environ.get("VRCT_CONFIG") else VRCT_CONFIG
-BRAIN_DIR = Path(os.environ.get("VRCT_BRAIN_DIR", BRAIN_DEFAULT))
+BRAIN_DIR = os.environ.get("VRCT_BRAIN_DIR", str(BRAIN_DEFAULT))
+BRAIN_DIR = Path(BRAIN_DIR) if BRAIN_DIR else None  # None: no brain, the bots translate on their own
 PASSWORD_FILE = CONF_DIR / "password"
 KEYS_FILE = CONF_DIR / "keys.json"   # {"Gemini_API": "...", "DeepL_API": "..."}, used when there's no VRCT
 CACHE_FILE = CACHE_DIR / "cache.json"
@@ -232,7 +233,7 @@ class Brain:
             now = time.monotonic()
             if now - self.checked >= RELOAD_EVERY:
                 self.checked = now
-                paths = list(dict.fromkeys(p for pattern in self.patterns for p in sorted(self.folder.glob(pattern))))
+                paths = list(dict.fromkeys(p for pattern in self.patterns for p in sorted(self.folder.glob(pattern)))) if self.folder else []
                 stamp = [[p.name, p.stat().st_mtime] for p in paths]
                 if stamp != self.knowledge.stamp:
                     terms, style, names = parse_notes(paths)
@@ -585,8 +586,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def allowed(self):
         ip = ipaddress.ip_address(self.client_address[0])
-        if not (ip.is_private or ip.is_loopback):
-            self.error(403, "home network only")
+        if not ip.is_loopback:
+            self.error(403, "this PC only")
             return False
         if not secrets.compare_digest(self.headers.get("Authorization", ""), f"Bearer {self.server.password}"):
             self.error(401, "wrong relay password")
@@ -676,7 +677,7 @@ def stats():
 
 def serve():
     keys()  # fail early if there are no API keys
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)  # this PC only (was 0.0.0.0 for friends)
     server.password, server.limit, server.router = password(), RateLimit(MAX_PER_MINUTE), Router()
     router = server.router
     router.cache.sync(router.brain.current().stamp)  # notes edited while the relay was off

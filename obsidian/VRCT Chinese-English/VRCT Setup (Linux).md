@@ -63,5 +63,5 @@ Backup of the settings before this change: `config.json.before-recommended`.
 
 ## VRChat side
 - **OSC:** already on.
-- **Steam launch option:** `~/.local/bin/vrchat-launch %command%` (use the full path, Steam does not expand `~`). It stops VRChat hanging at startup when the WiVRn server is running but the Quest isn't connected.
+- **Steam launch option:** `/home/oberon/.local/bin/vrchat-launch %command%`. It stops VRChat hanging at startup when the WiVRn server is running but the Quest isn't connected.
 - **VR mode:** connect the Quest in WiVRn **before** launching VRChat.
